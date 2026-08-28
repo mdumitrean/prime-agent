@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
@@ -36,9 +36,10 @@ import {
 } from "../../core/cron-jobs.js";
 import {
 	clearOrphanProcessJournal,
-	isOrphanProcessIdentityCurrent,
+	killOrphanProcess,
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
+	shouldReapOrphanProcess,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import {
@@ -48,6 +49,7 @@ import {
 } from "../../core/session-action-store.js";
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
+import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
@@ -190,6 +192,7 @@ const WORKER_STARTUP_GATE_FD = 3;
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
 	"list",
+	"list_agent_peers",
 	"list_saved_sessions",
 	"create",
 	"attach",
@@ -570,10 +573,6 @@ function workerSocketPath(supervisorSocketPath: string, workerId: string): strin
 	return join(defaultDaemonSocketDir(), `worker-${key}-${workerId.slice(0, 12)}.sock`);
 }
 
-function looksLikeSessionPath(selector: string): boolean {
-	return isAbsolute(selector) || selector.endsWith(".jsonl") || selector.includes("/") || selector.includes("\\");
-}
-
 function isFinalizedTranscriptEvent(eventType: string | undefined): boolean {
 	return (
 		eventType === "message_end" ||
@@ -678,7 +677,6 @@ export class DaemonSupervisor {
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
-	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
@@ -783,7 +781,6 @@ export class DaemonSupervisor {
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
-			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -1588,6 +1585,25 @@ export class DaemonSupervisor {
 				return undefined;
 			case "list":
 				return this.handleList(client, command);
+			case "list_agent_peers": {
+				const requester = [...this.workers.values()].find(
+					(worker) => worker.descriptor.authenticationToken === command.workerToken,
+				);
+				if (!requester) throw new Error("Worker authentication failed");
+				const peers = [...this.workers.values()]
+					.filter(
+						(worker) =>
+							worker !== requester &&
+							this.isLiveWorker(worker) &&
+							worker.descriptor.lifecycle === "ready" &&
+							worker.client !== undefined,
+					)
+					.flatMap((worker) => {
+						const root = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+						return root ? [this.agentPeerSummary(root)] : [];
+					});
+				return success(command.id, command.type, { peers });
+			}
 			case "list_saved_sessions":
 				return this.handleSavedSessionList(client, command);
 			case "create": {
@@ -1603,7 +1619,6 @@ export class DaemonSupervisor {
 					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
 					if (response.success && isSessionSummary(response.data)) {
 						await this.refreshWorkerSummaries(worker);
-						await this.syncAgentPeers().catch(() => undefined);
 						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 					}
 					return responseWithId(response, command.id);
@@ -2217,7 +2232,6 @@ export class DaemonSupervisor {
 				.filter((worker) => !this.isWorkerStopping(worker))
 				.map((worker) => this.refreshWorkerSummaries(worker).catch(() => undefined)),
 		);
-		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
 		// Stopping workers stay listed (with an honest workerState) because this
 		// list also feeds busy-daemon safety checks in daemon-launch.
@@ -2394,7 +2408,6 @@ export class DaemonSupervisor {
 			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
 			this.workers.delete(worker.descriptor.workerId);
 			this.deleteWorkerDescriptor(worker);
-			await this.syncAgentPeers().catch(() => undefined);
 			return true;
 		}
 		// Fail fast before waiting on anything: only a confirmed-dead process is
@@ -2446,7 +2459,6 @@ export class DaemonSupervisor {
 		}
 		worker.launchEnv = undefined;
 		worker.transientCreateCommand = undefined;
-		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
 	private async launchWorker(
@@ -2628,7 +2640,6 @@ export class DaemonSupervisor {
 				worker.launchEnv = undefined;
 				worker.transientCreateCommand = undefined;
 			}
-			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			this.broadcastHeartbeatsChanged();
 			return worker;
 		} catch (error) {
@@ -2883,7 +2894,6 @@ export class DaemonSupervisor {
 		worker.descriptor.lifecycle = "recovering";
 		worker.descriptor.lastError = error.message;
 		this.persistWorker(worker);
-		void this.syncAgentPeers().catch(() => undefined);
 		void this.recoverWorker(worker);
 	}
 
@@ -2936,7 +2946,6 @@ export class DaemonSupervisor {
 			worker.descriptor.lifecycle = "recovering";
 			worker.descriptor.lastError = disconnectError.message;
 			this.persistWorker(worker);
-			void this.syncAgentPeers().catch(() => undefined);
 			void this.recoverWorker(worker);
 			return;
 		}
@@ -3232,9 +3241,6 @@ export class DaemonSupervisor {
 							worker.descriptor.lifecycle = "ready";
 							worker.descriptor.consecutiveFailures = 0;
 							this.persistWorker(worker);
-							await this.syncAgentPeers().catch((error) =>
-								this.log(`Could not synchronize agent peers after worker recovery: ${String(error)}`),
-							);
 							this.broadcastHeartbeatsChanged();
 							return;
 						} catch (error) {
@@ -3263,7 +3269,6 @@ export class DaemonSupervisor {
 						worker.descriptor.lifecycle = "failed";
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
-						await this.syncAgentPeers().catch(() => undefined);
 						this.scheduleFailedWorkerReprobe(worker);
 						return;
 					}
@@ -3299,7 +3304,6 @@ export class DaemonSupervisor {
 			}
 			worker.descriptor.lifecycle = "failed";
 			this.persistWorker(worker);
-			await this.syncAgentPeers().catch(() => undefined);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 			this.scheduleFailedWorkerReprobe(worker);
 		})().finally(() => {
@@ -3326,19 +3330,10 @@ export class DaemonSupervisor {
 		if (orphanProcessJournalPath) {
 			try {
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!isOrphanProcessIdentityCurrent(orphan)) {
+					if (!shouldReapOrphanProcess(orphan)) {
 						continue;
 					}
-					const { pid } = orphan;
-					try {
-						process.kill(-pid, "SIGKILL");
-					} catch {
-						try {
-							process.kill(pid, "SIGKILL");
-						} catch {
-							// The detached resource may already have exited.
-						}
-					}
+					killOrphanProcess(orphan.pid);
 				}
 				clearOrphanProcessJournal(orphanProcessJournalPath);
 			} catch (error) {
@@ -3573,35 +3568,6 @@ export class DaemonSupervisor {
 				ignoreSessionId: target.id,
 			},
 		);
-	}
-
-	private syncAgentPeers(): Promise<void> {
-		const sync = this.agentPeerSyncQueue
-			.catch(() => undefined)
-			.then(async () => {
-				const readyWorkers = [...this.workers.values()].filter(
-					(worker): worker is ResidentWorker & { client: DaemonWorkerClient } =>
-						this.isLiveWorker(worker) && worker.descriptor.lifecycle === "ready" && worker.client !== undefined,
-				);
-				await Promise.all(
-					readyWorkers.map(async (worker) => {
-						const peers = [
-							...readyWorkers
-								.filter((candidate) => candidate !== worker)
-								.flatMap((candidate) => {
-									const root = candidate.summaries.get(candidate.descriptor.rootActiveSessionId);
-									return root ? [this.agentPeerSummary(root)] : [];
-								}),
-						];
-						const response = await worker.client.requestWorker({ type: "worker_sync_agent_peers", peers }, 5000);
-						if (!response.success) {
-							throw new Error(response.error);
-						}
-					}),
-				);
-			});
-		this.agentPeerSyncQueue = sync;
-		return sync;
 	}
 
 	private isVisibleWorker(worker: ResidentWorker): boolean {
@@ -4707,17 +4673,13 @@ export class DaemonSupervisor {
 			this.writeSerialized(client, publicPayload);
 		}
 		if (outboundType === "session_replaced" || outboundType === "session_closed") {
-			void this.refreshWorkerSummaries(worker)
-				.then(() => this.syncAgentPeers())
-				.catch(() => undefined);
+			void this.refreshWorkerSummaries(worker).catch(() => undefined);
 		} else if (
 			sessionEventType === "turn_start" ||
 			sessionEventType === "turn_end" ||
 			sessionEventType === "rlm_child_update"
 		) {
-			void this.refreshWorkerSummaries(worker)
-				.then(() => this.syncAgentPeers())
-				.catch(() => undefined);
+			void this.refreshWorkerSummaries(worker).catch(() => undefined);
 		}
 		if (
 			decodedOutbound?.type === "session_closed" &&
@@ -4733,7 +4695,6 @@ export class DaemonSupervisor {
 				this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
 				this.workers.delete(worker.descriptor.workerId);
 				this.deleteWorkerDescriptor(worker);
-				void this.syncAgentPeers().catch(() => undefined);
 			}
 		}
 	}
@@ -5298,7 +5259,6 @@ export class DaemonSupervisor {
 			this.deleteWorkerDescriptor(worker);
 		}
 		if (!this.shuttingDown) {
-			void this.syncAgentPeers().catch(() => undefined);
 			this.broadcastHeartbeatsChanged();
 		}
 	}
