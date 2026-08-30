@@ -59,6 +59,7 @@ import { createActiveSessionId, type DaemonSocketClient } from "./active-session
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
+import { installDaemonCrashHandlers } from "./daemon-crash-handlers.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
@@ -172,6 +173,12 @@ const FAILED_WORKER_REPROBE_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 60_000, 
 // which respawns more rivals. Adopt within a budget instead and let whatever is
 // still recovering finish in the background, exactly as a runtime disconnect does.
 const WORKER_ADOPTION_STARTUP_BUDGET_MS = 10_000;
+/**
+ * A worker mid-turn with many child agents can take a while to answer `list`;
+ * recovery runs in the background, so give it more room than a live refresh
+ * before writing the worker off.
+ */
+const WORKER_RECOVERY_LIST_TIMEOUT_MS = 15_000;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
@@ -627,6 +634,7 @@ function mergeSessionLists(active: readonly SessionSummary[], saved: readonly Se
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const supervisor = new DaemonSupervisor(socketPath, options);
+	supervisor.installCrashHandlers();
 	try {
 		await supervisor.start();
 	} catch (error) {
@@ -3265,9 +3273,18 @@ export class DaemonSupervisor {
 					}
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
-						await this.recoverUncertainWorkerOperations(worker, false);
+						// A live worker that merely stopped answering keeps everything it
+						// owns: its kernels and shells are not orphans, and it is still
+						// writing its transcripts. The re-probe below adopts it again once it
+						// answers; only a dead (or replaced) process gets cleaned up here.
+						const liveWorkerProcess = this.isWorkerProcessIdentityIntact(worker);
+						if (!liveWorkerProcess) {
+							await this.recoverUncertainWorkerOperations(worker, false);
+						}
 						worker.descriptor.lifecycle = "failed";
-						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
+						worker.descriptor.lastError = liveWorkerProcess
+							? "Session worker is alive but not answering"
+							: "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
 						this.scheduleFailedWorkerReprobe(worker);
 						return;
@@ -3325,6 +3342,17 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+		} else if (this.isWorkerProcessIdentityIntact(worker)) {
+			// Reaping journaled children and marking transcripts interrupted is
+			// only safe once the worker process is gone. A live worker still owns
+			// its kernels and shells; killing them from here crashes it mid-turn
+			// (its next kernel write fails with EPIPE) and races its transcript
+			// writes with the interruption marker.
+			this.log(
+				`Leaving live worker ${worker.descriptor.workerId} (pid ${worker.descriptor.pid}) untouched: ` +
+					"its processes and transcripts are reclaimed only after it exits",
+			);
+			return;
 		}
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
@@ -3399,7 +3427,7 @@ export class DaemonSupervisor {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const response = await worker.client.request({ type: "list" }, recovery ? WORKER_RECOVERY_LIST_TIMEOUT_MS : 5000);
 		const summaries = sessionSummariesFromResponse(response);
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		for (const summary of summaries) {
@@ -3678,6 +3706,33 @@ export class DaemonSupervisor {
 		throw new Error(`Unknown active session: ${selector}`);
 	}
 
+	/**
+	 * A client reconnecting to its root session must be able to tell a worker
+	 * that is still being recovered (worth retrying) or whose process is gone
+	 * (only a fresh create can bring the session back) from a session that
+	 * never existed. A worker that is alive but not answering is reported as
+	 * recovering: its re-probe is still pending. Sessions the client may not
+	 * see stay unknown.
+	 */
+	private describeUnreachableWorker(client: DaemonSocketClient, selector: string, error: unknown): unknown {
+		if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) {
+			return error;
+		}
+		const worker = [...this.workers.values()].find(
+			(candidate) =>
+				this.isWorkerAccessibleToClient(client, candidate) &&
+				(candidate.descriptor.rootActiveSessionId === selector || candidate.descriptor.rootSessionId === selector),
+		);
+		if (!worker || (worker.client !== undefined && worker.descriptor.lifecycle === "ready")) {
+			return error;
+		}
+		const state = this.effectiveWorkerState(worker);
+		if (state === "failed" && this.isWorkerProcessIdentityIntact(worker)) {
+			return new Error("Session worker is recovering");
+		}
+		return new Error(`Session worker is ${state}`);
+	}
+
 	private findWorkerForClient(client: DaemonSocketClient, selector: string): Promise<WorkerMatch> {
 		return this.findWorker(selector, (worker) => this.isWorkerAccessibleToClient(client, worker));
 	}
@@ -3824,7 +3879,9 @@ export class DaemonSupervisor {
 				await this.recoverWorker(ownedWorker);
 			}
 		}
-		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		const match = await this.findWorkerForClient(client, command.activeSessionId).catch((error: unknown) => {
+			throw this.describeUnreachableWorker(client, command.activeSessionId, error);
+		});
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
@@ -5425,6 +5482,14 @@ export class DaemonSupervisor {
 			client.backpressured = true;
 		}
 		return accepted;
+	}
+
+	/**
+	 * The supervisor runs detached with ignored stdio, so a crash outside a
+	 * command handler would otherwise leave no trace of why the daemon died.
+	 */
+	installCrashHandlers(): void {
+		this.signalCleanupHandlers.push(installDaemonCrashHandlers((message) => this.log(message)));
 	}
 
 	private registerSignalHandlers(): void {
